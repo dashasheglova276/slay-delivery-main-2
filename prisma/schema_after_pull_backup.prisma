@@ -1,0 +1,259 @@
+// Единая схема данных для Slay Delivery.
+// Заменяет: src/data/products.ts, src/data/orders.ts, src/data/couriers.ts
+// и хранилища useOperationsStore / useOrdersStore.
+//
+// Важно про enum'ы: в БД они хранятся в UPPER_SNAKE (стандарт Prisma/Postgres),
+// а в приложении (UI, src/types/index.ts) статусы остаются такими же, как были —
+// "new" | "accepted" | ... Конвертация между двумя представлениями происходит
+// в одном месте: src/lib/data-service.ts. Компоненты и страницы этого не видят.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  COURIER
+  CUSTOMER
+}
+
+enum OrderStatus {
+  NEW
+  ACCEPTED
+  PICKED_UP
+  IN_TRANSIT
+  DELIVERED
+  CANCELLED
+}
+
+enum PaymentMethod {
+  CASH
+  CARD
+  ONLINE
+}
+
+/// Единый пользователь для всех трёх ролей.
+/// Курьер — это User с role = COURIER, у него же activeOrdersCount считается
+/// на лету (count заказов в работе), а не хранится отдельным полем.
+model User {
+  id              String    @id @default(cuid())
+  phone           String    @unique
+  name            String
+  role            Role      @default(CUSTOMER)
+  passwordHash    String?
+  avatarSeed      String?
+  isActive        Boolean   @default(true)
+  termsAcceptedAt DateTime?
+  createdAt       DateTime  @default(now())
+
+  ordersAsCustomer Order[]      @relation("CustomerOrders")
+  ordersAsCourier  Order[]      @relation("CourierOrders")
+  sessions         Session[]
+  promoUsages      PromoUsage[]
+  statusChanges    OrderStatusHistory[]
+  addresses        Address[]
+
+  @@index([role])
+}
+
+model Address {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// Метка адреса, например "Дом", "Работа".
+  label     String
+  address   String
+  entrance  String?
+  floor     String?
+  apartment String?
+  comment   String?
+  lat       Float?
+  lng       Float?
+  isDefault Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+model Category {
+  slug  String  @id
+  name  String
+  emoji String
+  /// Картинка категории для админки/шапки каталога. Необязательна — если нет,
+  /// в UI используется эмодзи-заглушка.
+  image String?
+  /// Порядок отображения категории на сайте (чем меньше — тем выше). Управляется
+  /// в админке (кнопки "выше"/"ниже" или drag&drop).
+  order Int     @default(0)
+
+  @@index([order])
+}
+
+/// Рецепт из раздела "Рецепты". Ингредиенты — отдельная модель RecipeIngredient,
+/// каждая строка которой ссылается на реальный Product, чтобы можно было
+/// одной кнопкой добавить весь рецепт в корзину.
+model Recipe {
+  slug            String   @id
+  title           String
+  image           String
+  cookTimeMinutes Int
+  /// "Легко" | "Средне" | "Сложно" — храним строкой, как и остальные enum-подобные
+  /// поля в проекте, отображаемые напрямую в UI без маппинга.
+  difficulty      String
+  description     String   @db.Text
+  steps           String[]
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  ingredients RecipeIngredient[]
+}
+
+model RecipeIngredient {
+  id         String  @id @default(cuid())
+  recipeSlug String
+  recipe     Recipe  @relation(fields: [recipeSlug], references: [slug], onDelete: Cascade)
+  productId  String
+  product    Product @relation(fields: [productId], references: [id])
+  /// Отображаемое название ингредиента (может отличаться от Product.name,
+  /// например "Яйца куриные С1, 10 шт" вместо просто "Яйца").
+  name       String
+  /// Порядок в списке ингредиентов рецепта.
+  order      Int     @default(0)
+
+  @@index([recipeSlug])
+  @@index([productId])
+}
+
+model Product {
+  id               String   @id
+  name             String
+  categorySlug     String
+  categoryName     String
+  price            Int
+  oldPrice         Int?
+  unit             String
+  weight           Float
+  description      String   @db.Text
+  composition      String   @db.Text
+  manufacturer     String
+  shelfLife        String
+  storage          String   @db.Text
+  image            String
+  images           String[]
+  rating           Float    @default(5)
+  reviewsCount     Int      @default(0)
+  isNew            Boolean  @default(false)
+  discountPercent  Int      @default(0)
+  inStock          Boolean  @default(true)
+  /// Ручной флаг "популярный товар" — используется для кураторских подборок
+  /// (главная страница, промо), отдельно от rating/reviewsCount.
+  featured         Boolean  @default(false)
+  /// Вручную подобранные похожие товары (id). Если пусто — карточка товара
+  /// показывает автоматическую подборку по категории (getRelatedProducts).
+  relatedIds       String[] @default([])
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  recipeIngredients RecipeIngredient[]
+
+  @@index([categorySlug])
+}
+
+model Order {
+  id            String        @id
+  createdAt     DateTime      @default(now())
+
+  customerId    String?
+  customer      User?         @relation("CustomerOrders", fields: [customerId], references: [id])
+  customerName  String
+  customerPhone String
+  address       String
+  comment       String?
+
+  items         OrderItem[]
+
+  subtotal      Int
+  deliveryFee   Int
+  discount      Int           @default(0) // скидки по товарам (oldPrice - price)
+  promoCode     String?
+  promoDiscount Int           @default(0)
+  total         Int
+  paymentMethod PaymentMethod
+  status        OrderStatus   @default(NEW)
+
+  courierId     String?
+  courier       User?         @relation("CourierOrders", fields: [courierId], references: [id])
+
+  statusHistory OrderStatusHistory[]
+
+  @@index([status])
+  @@index([courierId])
+  @@index([customerId])
+}
+
+model OrderItem {
+  id        String @id @default(cuid())
+  orderId   String
+  order     Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId String
+  name      String
+  quantity  Int
+  price     Int
+  image     String
+}
+
+/// Полная история смены статусов заказа — кто и когда её изменил.
+model OrderStatusHistory {
+  id        String      @id @default(cuid())
+  orderId   String
+  order     Order       @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  status    OrderStatus
+  changedAt DateTime    @default(now())
+  changedBy String?
+  changedByUser User?   @relation(fields: [changedBy], references: [id])
+
+  @@index([orderId])
+}
+
+model PromoCode {
+  code            String   @id
+  discountPercent Int
+  isActive        Boolean  @default(true)
+  expiresAt       DateTime?
+  maxUses         Int?
+  createdAt       DateTime @default(now())
+}
+
+/// Гарантирует, что один пользователь использует один промокод только один раз.
+model PromoUsage {
+  id        String   @id @default(cuid())
+  promoCode String
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  orderId   String?
+  usedAt    DateTime @default(now())
+
+  @@unique([promoCode, userId])
+}
+
+/// Централизованный лог серверных ошибок (API route handlers, data-service).
+model ErrorLog {
+  id        String   @id @default(cuid())
+  message   String
+  context   String?
+  createdAt DateTime @default(now())
+}

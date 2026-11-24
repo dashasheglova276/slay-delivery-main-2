@@ -1,0 +1,344 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+/// Единый пользователь для всех трёх ролей.
+/// Курьер — это User с role = COURIER, у него же activeOrdersCount считается
+/// на лету (count заказов в работе), а не хранится отдельным полем.
+model User {
+  id               String               @id @default(cuid())
+  phone            String               @unique
+  name             String
+  role             Role                 @default(CUSTOMER)
+  passwordHash     String?
+  avatarSeed       String?
+  avatarUrl        String?
+  isActive         Boolean              @default(true)
+  termsAcceptedAt  DateTime?
+  createdAt        DateTime             @default(now())
+  addresses        Address[]
+  ordersAsCourier  Order[]              @relation("CourierOrders")
+  ordersAsCustomer Order[]              @relation("CustomerOrders")
+  statusChanges    OrderStatusHistory[]
+  promoUsages      PromoUsage[]
+  sessions         Session[]
+
+  @@index([role])
+}
+
+model Address {
+  id        String   @id @default(cuid())
+  userId    String
+  /// Метка адреса, например "Дом", "Работа".
+  label     String
+  address   String
+  entrance  String?
+  floor     String?
+  apartment String?
+  comment   String?
+  lat       Float?
+  lng       Float?
+  isDefault Boolean  @default(false)
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model PickupLocation {
+  id          String   @id @default(cuid())
+  name        String
+  address     String
+  lat         Float?
+  lng         Float?
+  description String?
+  hours       String
+  contact     String?
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  orders      Order[]
+
+  @@index([active])
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Category {
+  slug  String  @id
+  name  String
+  emoji String
+  /// Картинка категории для админки/шапки каталога. Необязательна — если нет,
+  /// в UI используется эмодзи-заглушка.
+  image String?
+  /// Порядок отображения категории на сайте (чем меньше — тем выше). Управляется
+  /// в админке (кнопки "выше"/"ниже" или drag&drop).
+  order Int     @default(0)
+  /// Скрыть категорию с публичной витрины, не удаляя её и не трогая товары внутри.
+  active Boolean @default(true)
+
+  @@index([order])
+}
+
+/// Подборка товаров для главной/каталога (например "Для завтрака", "Скидки недели").
+/// Ссылается на существующие Product по id — без дублирования каталога.
+model Collection {
+  slug      String           @id
+  title     String
+  image     String?
+  order     Int              @default(0)
+  active    Boolean          @default(true)
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+  items     CollectionItem[]
+
+  @@index([order])
+}
+
+model CollectionItem {
+  id             String     @id @default(cuid())
+  collectionSlug String
+  productId      String
+  /// Порядок товара внутри подборки.
+  order          Int        @default(0)
+  product        Product    @relation(fields: [productId], references: [id])
+  collection     Collection @relation(fields: [collectionSlug], references: [slug], onDelete: Cascade)
+
+  @@index([collectionSlug])
+  @@index([productId])
+}
+
+/// Рецепт из раздела "Рецепты". Ингредиенты — отдельная модель RecipeIngredient,
+/// каждая строка которой ссылается на реальный Product, чтобы можно было
+/// одной кнопкой добавить весь рецепт в корзину.
+model Recipe {
+  slug            String             @id
+  title           String
+  image           String
+  cookTimeMinutes Int
+  /// "Легко" | "Средне" | "Сложно" — храним строкой, как и остальные enum-подобные
+  /// поля в проекте, отображаемые напрямую в UI без маппинга.
+  difficulty      String
+  description     String
+  steps           String[]
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+  ingredients     RecipeIngredient[]
+}
+
+model RecipeIngredient {
+  id         String  @id @default(cuid())
+  recipeSlug String
+  productId  String
+  /// Отображаемое название ингредиента (может отличаться от Product.name,
+  /// например "Яйца куриные С1, 10 шт" вместо просто "Яйца").
+  name       String
+  /// Порядок в списке ингредиентов рецепта.
+  order      Int     @default(0)
+  product    Product @relation(fields: [productId], references: [id])
+  recipe     Recipe  @relation(fields: [recipeSlug], references: [slug], onDelete: Cascade)
+
+  @@index([recipeSlug])
+  @@index([productId])
+}
+
+model Product {
+  id                String             @id
+  name              String
+  categorySlug      String
+  categoryName      String
+  price             Int
+  oldPrice          Int?
+  unit              String
+  weight            Float
+  description       String
+  composition       String
+  manufacturer      String
+  shelfLife         String
+  storage           String
+  image             String
+  images            String[]
+  rating            Float              @default(5)
+  reviewsCount      Int                @default(0)
+  isNew             Boolean            @default(false)
+  discountPercent   Int                @default(0)
+  inStock           Boolean            @default(true)
+  featured          Boolean            @default(false)
+  relatedIds        String[]           @default([])
+  createdAt         DateTime           @default(now())
+  updatedAt         DateTime           @updatedAt
+  saleType          SaleType           @default(PIECE)
+  step              Float              @default(1)
+  /// Скрыть товар с публичной витрины, не удаляя его (отличается от inStock —
+  /// то временная недоступность, active — управляемая видимость в каталоге).
+  active            Boolean            @default(true)
+  recipeIngredients RecipeIngredient[]
+  collectionItems   CollectionItem[]
+
+  @@index([categorySlug])
+}
+
+model Order {
+  id            String               @id
+  createdAt     DateTime             @default(now())
+  customerId    String?
+  customerName  String
+  customerPhone String
+  address       String
+  fulfillmentType FulfillmentType @default(DELIVERY)
+  pickupLocationId String?
+  comment       String?
+  subtotal      Int
+  deliveryFee   Int
+  discount      Int                  @default(0)
+  promoCode     String?
+  promoDiscount Int                  @default(0)
+  total         Int
+  paymentMethod PaymentMethod
+  status        OrderStatus          @default(NEW)
+  courierId     String?
+  paymentId     String?              @unique
+  paymentStatus PaymentStatus        @default(PENDING)
+  tip           Int                  @default(0)
+  courierRating Int?
+  courierRatedAt DateTime?
+  courier       User?                @relation("CourierOrders", fields: [courierId], references: [id])
+  customer      User?                @relation("CustomerOrders", fields: [customerId], references: [id])
+  pickupLocation PickupLocation?     @relation(fields: [pickupLocationId], references: [id], onDelete: Restrict)
+  items         OrderItem[]
+  statusHistory OrderStatusHistory[]
+  messages      OrderMessage[]
+
+  @@index([status])
+  @@index([courierId])
+  @@index([customerId])
+}
+
+model OrderMessage {
+  id        String   @id @default(cuid())
+  orderId   String
+  senderId  String
+  body      String
+  createdAt DateTime @default(now())
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  @@index([orderId, createdAt])
+}
+
+model ShopSettings {
+  id String @id @default("main")
+  fuelPerKm Float @default(8)
+  averageKm Float @default(4)
+  bagCost Float @default(12)
+  packingCost Float @default(8)
+  paymentPercent Float @default(2.5)
+  otherOrderCost Float @default(0)
+  baseDeliveryFee Int @default(199)
+  weatherSurcharge Int @default(50)
+  demandSurcharge Int @default(50)
+  updatedAt DateTime @updatedAt
+}
+
+model OrderItem {
+  id        String @id @default(cuid())
+  orderId   String
+  productId String
+  name      String
+  quantity  Int
+  price     Int
+  image     String
+  saleType  SaleType @default(PIECE)
+  unit      String   @default("шт")
+  order     Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+}
+
+/// Полная история смены статусов заказа — кто и когда её изменил.
+model OrderStatusHistory {
+  id            String      @id @default(cuid())
+  orderId       String
+  status        OrderStatus
+  changedAt     DateTime    @default(now())
+  changedBy     String?
+  changedByUser User?       @relation(fields: [changedBy], references: [id])
+  order         Order       @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+}
+
+model PromoCode {
+  code            String    @id
+  discountPercent Int
+  isActive        Boolean   @default(true)
+  expiresAt       DateTime?
+  maxUses         Int?
+  createdAt       DateTime  @default(now())
+}
+
+/// Гарантирует, что один пользователь использует один промокод только один раз.
+model PromoUsage {
+  id        String   @id @default(cuid())
+  promoCode String
+  userId    String
+  orderId   String?
+  usedAt    DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([promoCode, userId])
+}
+
+/// Централизованный лог серверных ошибок (API route handlers, data-service).
+model ErrorLog {
+  id        String   @id @default(cuid())
+  message   String
+  context   String?
+  createdAt DateTime @default(now())
+}
+
+enum Role {
+  ADMIN
+  COURIER
+  CUSTOMER
+}
+
+enum OrderStatus {
+  NEW
+  ACCEPTED
+  PICKED_UP
+  IN_TRANSIT
+  DELIVERED
+  CANCELLED
+}
+
+enum PaymentMethod {
+  CASH
+  CARD
+  ONLINE
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+}
+
+enum SaleType {
+  PIECE
+  WEIGHT
+}
+
+enum FulfillmentType {
+  DELIVERY
+  PICKUP
+}
