@@ -16,18 +16,7 @@ const SIMFEROPOL_BOUNDS: [[number, number], [number, number]] = [
   [45.08, 34.25]
 ];
 
-function extractShortAddress(geoObject: any, fallbackText: string): string {
-  const components: { kind: string; name: string }[] =
-    geoObject?.metaDataProperty?.GeocoderMetaData?.Address?.Components ?? [];
-  const byKind = (kind: string) => components.find((c) => c.kind === kind)?.name;
-  const locality = byKind("locality") || byKind("area") || byKind("province");
-  const street = byKind("street");
-  const house = byKind("house");
-  const parts = [locality, [street, house].filter(Boolean).join(", ")].filter(Boolean);
-  return parts.length > 0 ? parts.join(", ") : fallbackText;
-}
-
-function suggestionLabel(item: any): string {
+function suggestionLabel(item: Suggestion): string {
   return String(item?.displayName || item?.value || "").trim();
 }
 
@@ -47,12 +36,16 @@ function browserPosition(
   });
 }
 
+type Suggestion = { displayName?: string; value?: string; lat?: number; lng?: number };
+
 export default function YandexMapPicker({
   onSelect,
+  onClear,
   value,
   className
 }: {
   onSelect: (data: { address: string; lat: number; lng: number }) => void;
+  onClear?: () => void;
   value?: string;
   className?: string;
 }) {
@@ -66,13 +59,15 @@ export default function YandexMapPicker({
   const queryRef = useRef(value ?? "");
   const emittedAddressRef = useRef("");
   const onSelectRef = useRef(onSelect);
+  const onClearRef = useRef(onClear);
   const reverseTimerRef = useRef(0);
+  const ignoreReverseUntilRef = useRef(0);
 
   const [ready, setReady] = useState(false);
   const [query, setQuery] = useState(value ?? "");
   const [scriptError, setScriptError] = useState(false);
   const [geocodeError, setGeocodeError] = useState(false);
-  const [suggestions, setSuggestions] = useState<any[]>([]);
+  const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
   const [suggestionsOpen, setSuggestionsOpen] = useState(false);
   const [suggestionBox, setSuggestionBox] = useState({ top: 0, left: 0, width: 0 });
   const [locating, setLocating] = useState(false);
@@ -80,6 +75,7 @@ export default function YandexMapPicker({
 
   queryRef.current = query;
   onSelectRef.current = onSelect;
+  onClearRef.current = onClear;
 
   const mapKey = process.env.NEXT_PUBLIC_YANDEX_MAPS_API_KEY;
   const suggestKey = process.env.NEXT_PUBLIC_YANDEX_SUGGEST_API_KEY;
@@ -100,7 +96,7 @@ export default function YandexMapPicker({
       setSuggestionsOpen(false);
       return;
     }
-    if (!ready || !ymaps || text.length < 2) {
+    if (!ready || text.length < 2) {
       setSuggestions([]);
       setSuggestionsOpen(false);
       return;
@@ -108,19 +104,40 @@ export default function YandexMapPicker({
     let active = true;
     const timer = window.setTimeout(() => {
       const request = /симферополь/i.test(text) ? text : `Симферополь, ${text}`;
-      ymaps.suggest(request, { boundedBy: SIMFEROPOL_BOUNDS, results: 8 })
-        .then((items: any[]) => {
-          if (!active) return;
-          const next = (items || []).filter((item) => suggestionLabel(item));
-          setSuggestions(next);
-          if (next.length > 0 && document.activeElement === inputRef.current) {
-            updateSuggestionBox();
-            setSuggestionsOpen(true);
-          } else {
-            setSuggestionsOpen(false);
-          }
+      const show = (next: Suggestion[]) => {
+        if (!active) return;
+        setSuggestions(next);
+        if (next.length > 0 && document.activeElement === inputRef.current) {
+          updateSuggestionBox();
+          setSuggestionsOpen(true);
+        } else {
+          setSuggestionsOpen(false);
+        }
+      };
+      const fromServer = () => fetch(`/api/geocode/search?q=${encodeURIComponent(request)}`, { cache: "no-store" })
+        .then((response) => response.ok ? response.json() : { results: [] })
+        .then((data) => {
+          const next = (data.results || []).map((item: { address: string; lat: number; lng: number }) => ({
+            displayName: item.address,
+            value: item.address,
+            lat: item.lat,
+            lng: item.lng
+          }));
+          show(next);
         })
         .catch(() => { if (active) setSuggestions([]); });
+      if (!ymaps?.suggest) {
+        void fromServer();
+        return;
+      }
+      ymaps.suggest(request, { boundedBy: SIMFEROPOL_BOUNDS, results: 8 })
+        .then((items: Suggestion[]) => {
+          if (!active) return;
+          const next = (items || []).filter((item) => suggestionLabel(item));
+          if (next.length > 0) show(next);
+          else void fromServer();
+        })
+        .catch(() => { if (active) void fromServer(); });
     }, 220);
     return () => { active = false; window.clearTimeout(timer); };
   }, [query, ready]);
@@ -133,60 +150,66 @@ export default function YandexMapPicker({
     onSelectRef.current({ address, lat: coords[0], lng: coords[1] });
   }, []);
 
-  const getAddress = useCallback(async (coords: [number, number]) => {
+  const getAddress = useCallback(async (coords: [number, number], snapToHouse = false) => {
     const requestId = ++addressRequestRef.current;
-    const apply = (address: string) => {
-      if (requestId !== addressRequestRef.current) return;
-      applyResolvedAddress(address, coords);
-    };
-    const precise = (address: string) => /[0-9]|ул|улица|просп|пер\.|переулок|бульвар/i.test(address);
-    let fallbackAddress = "";
-
-    try {
-      const ymaps = window.ymaps;
-      if (ymaps?.geocode) {
-        const response = await ymaps.geocode(coords, { results: 1, kind: "house" }).catch(() => ymaps.geocode(coords, { results: 1 }));
-        if (requestId !== addressRequestRef.current) return;
-        const geoObject = response?.geoObjects?.get?.(0);
-        if (geoObject) {
-          const meta = geoObject.properties.get("metaDataProperty")?.GeocoderMetaData
-            ?? geoObject.properties.get("metaDataProperty.GeocoderMetaData");
-          const fullText = meta?.text ?? geoObject.getAddressLine?.() ?? `${coords[0]}, ${coords[1]}`;
-          const address = extractShortAddress({ metaDataProperty: { GeocoderMetaData: meta } }, fullText);
-          if (precise(address)) {
-            apply(address);
-            return;
-          }
-          fallbackAddress = address;
-        }
-      }
-    } catch {
-      // Fall through to the HTTP geocoder.
-    }
-
     try {
       const response = await fetch(`/api/geocode/reverse?lat=${encodeURIComponent(String(coords[0]))}&lng=${encodeURIComponent(String(coords[1]))}`, { cache: "no-store" });
       if (requestId !== addressRequestRef.current) return;
       const data = await response.json().catch(() => ({}));
       if (response.ok && data.address) {
-        apply(String(data.address));
+        const resolved: [number, number] = [
+          Number.isFinite(Number(data.lat)) ? Number(data.lat) : coords[0],
+          Number.isFinite(Number(data.lng)) ? Number(data.lng) : coords[1]
+        ];
+        const moved = Math.abs(resolved[0] - coords[0]) > 0.00003 || Math.abs(resolved[1] - coords[1]) > 0.00003;
+        if (snapToHouse && moved && mapRef.current) {
+          ignoreReverseUntilRef.current = Date.now() + 500;
+          mapRef.current.setCenter(resolved, 17, { duration: 280 });
+        }
+        applyResolvedAddress(String(data.address), snapToHouse ? resolved : coords);
         return;
       }
     } catch {
-      // Keep the geocode error below.
+      if (requestId !== addressRequestRef.current) return;
     }
-
     if (requestId !== addressRequestRef.current) return;
-    if (fallbackAddress) {
-      apply(fallbackAddress);
-      return;
-    }
     setGeocodeError(true);
   }, [applyResolvedAddress]);
 
+  const panTo = useCallback((coords: [number, number]) => {
+    const map = mapRef.current;
+    if (!map) return;
+    ignoreReverseUntilRef.current = Date.now() + 350;
+    map.setCenter(coords, 17, { duration: 280 });
+  }, []);
+
+  const searchAddress = useCallback(async (rawQuery: string) => {
+    const addressQuery = rawQuery.trim();
+    const map = mapRef.current;
+    if (!map || addressQuery.length < 2) return;
+    const requestId = ++addressRequestRef.current;
+    userAdjustedLocationRef.current = true;
+    const normalizedQuery = /симферополь/i.test(addressQuery) ? addressQuery : `Симферополь, ${addressQuery}`;
+    try {
+      const response = await fetch(`/api/geocode/search?q=${encodeURIComponent(normalizedQuery)}`, { cache: "no-store" });
+      if (requestId !== addressRequestRef.current) return;
+      const data = await response.json().catch(() => ({}));
+      const hit = data.results?.[0];
+      if (!response.ok || !hit || !Number.isFinite(hit.lat) || !Number.isFinite(hit.lng)) {
+        setGeocodeError(true);
+        return;
+      }
+      const coords: [number, number] = [Number(hit.lat), Number(hit.lng)];
+      panTo(coords);
+      applyResolvedAddress(String(hit.address || normalizedQuery), coords);
+    } catch {
+      if (requestId === addressRequestRef.current) setGeocodeError(true);
+    }
+  }, [applyResolvedAddress, panTo]);
+
   const scheduleGetAddress = useCallback((coords: [number, number]) => {
     window.clearTimeout(reverseTimerRef.current);
-    reverseTimerRef.current = window.setTimeout(() => { void getAddress(coords); }, 180);
+    reverseTimerRef.current = window.setTimeout(() => { void getAddress(coords); }, 120);
   }, [getAddress]);
 
   useEffect(() => {
@@ -194,20 +217,10 @@ export default function YandexMapPicker({
     if (value === queryRef.current || value === emittedAddressRef.current) return;
     if (document.activeElement === inputRef.current) return;
     setQuery(value);
-    const ymaps = window.ymaps;
-    const map = mapRef.current;
     const trimmed = value.trim();
-    if (!ymaps || !map || !trimmed) return;
-    ymaps.geocode(trimmed, { results: 1, boundedBy: SIMFEROPOL_BOUNDS })
-      .then((res: any) => {
-        const first = res.geoObjects.get(0);
-        if (!first) return;
-        const coords = first.geometry.getCoordinates() as [number, number];
-        map.setCenter(coords, 17, { duration: 280 });
-        void getAddress(coords);
-      })
-      .catch(() => setGeocodeError(true));
-  }, [value, getAddress]);
+    if (!mapRef.current || !trimmed) return;
+    void searchAddress(trimmed);
+  }, [value, searchAddress]);
 
   useEffect(() => {
     if (!mapKey) return;
@@ -239,8 +252,8 @@ export default function YandexMapPicker({
       if (fromDevice && !inDeliveryZone(coords)) {
         throw new Error("outside-zone");
       }
-      map.setCenter(coords, 17, { duration: 450 });
-      void getAddress(coords);
+      panTo(coords);
+      void getAddress(coords, true);
       setLocating(false);
       setLocationError(false);
     };
@@ -280,30 +293,7 @@ export default function YandexMapPicker({
     void getAddress(center);
     setLocating(false);
     setLocationError(true);
-  }, [getAddress]);
-
-  function searchTypedAddress(rawQuery = inputRef.current?.value ?? query) {
-    const ymaps = window.ymaps;
-    const map = mapRef.current;
-    const addressQuery = rawQuery.trim();
-    if (!ymaps || !map || !addressQuery) return;
-    userAdjustedLocationRef.current = true;
-    setQuery(addressQuery);
-    const normalizedQuery = /симферополь/i.test(addressQuery) ? addressQuery : `Симферополь, ${addressQuery}`;
-    ymaps
-      .geocode(normalizedQuery, { results: 1, boundedBy: SIMFEROPOL_BOUNDS })
-      .then((res: any) => {
-        const first = res.geoObjects.get(0);
-        if (!first) {
-          setGeocodeError(true);
-          return;
-        }
-        const coords = first.geometry.getCoordinates() as [number, number];
-        map.setCenter(coords, 17, { duration: 280 });
-        void getAddress(coords);
-      })
-      .catch(() => setGeocodeError(true));
-  }
+  }, [getAddress, panTo]);
 
   useEffect(() => {
     const viewport = containerRef.current;
@@ -313,7 +303,7 @@ export default function YandexMapPicker({
       center: DEFAULT_CENTER,
       zoom: 16,
       controls: ["zoomControl"],
-      behaviors: ["drag", "multiTouch", "dblClickZoom", "scrollZoom"]
+      behaviors: ["drag", "multiTouch", "dblClickZoom"]
     }, { yandexMapDisablePoiInteractivity: true });
     map.behaviors.enable("drag");
     map.behaviors.enable("multiTouch");
@@ -321,6 +311,7 @@ export default function YandexMapPicker({
     mapRef.current = map;
 
     const reverseFromCenter = () => {
+    if (Date.now() < ignoreReverseUntilRef.current) return;
       userAdjustedLocationRef.current = true;
       const center = map.getCenter() as [number, number];
       scheduleGetAddress(center);
@@ -330,13 +321,12 @@ export default function YandexMapPicker({
       userAdjustedLocationRef.current = true;
     });
     map.events.add("actionend", reverseFromCenter);
-    map.events.add("boundschange", reverseFromCenter);
-    map.events.add("mouseup", reverseFromCenter);
-
+    viewport.addEventListener("pointerup", reverseFromCenter);
     viewport.addEventListener("touchend", reverseFromCenter, { passive: true });
-    void locateMe();
+    if (!queryRef.current.trim()) void locateMe();
     return () => {
       window.clearTimeout(reverseTimerRef.current);
+      viewport.removeEventListener("pointerup", reverseFromCenter);
       viewport.removeEventListener("touchend", reverseFromCenter);
       map.destroy();
       mapRef.current = null;
@@ -344,21 +334,35 @@ export default function YandexMapPicker({
   }, [ready, locateMe, scheduleGetAddress]);
 
   useEffect(() => {
+    if (!ready) return;
+    const text = query.trim();
+    if (text.length < 5 || !/\d/.test(text) || text === emittedAddressRef.current) return;
+    const timer = window.setTimeout(() => { void searchAddress(text); }, 650);
+    return () => window.clearTimeout(timer);
+  }, [query, ready, searchAddress]);
+
+  useEffect(() => {
     const onLocate = () => { void locateMe(); };
     window.addEventListener("starfood:locate-me", onLocate);
     return () => window.removeEventListener("starfood:locate-me", onLocate);
   }, [locateMe]);
 
-  function chooseSuggestion(item: any) {
+  function chooseSuggestion(item: Suggestion) {
     const selected = suggestionLabel(item);
     if (!selected) return;
-    const cityAddress = /симферополь/i.test(selected) ? selected : `Симферополь, ${selected}`;
     userAdjustedLocationRef.current = true;
     suppressSuggestionsRef.current = true;
     setSuggestionsOpen(false);
     setSuggestions([]);
+    if (typeof item.lat === "number" && typeof item.lng === "number") {
+      const coords: [number, number] = [item.lat, item.lng];
+      panTo(coords);
+      applyResolvedAddress(selected, coords);
+      return;
+    }
+    const cityAddress = /симферополь/i.test(selected) ? selected : `Симферополь, ${selected}`;
     setQuery(cityAddress);
-    searchTypedAddress(item.value || cityAddress);
+    void searchAddress(item.value || cityAddress);
   }
 
   if (!mapKey) {
@@ -403,11 +407,15 @@ export default function YandexMapPicker({
             if (e.key === "Enter") {
               e.preventDefault();
               setSuggestionsOpen(false);
-              searchTypedAddress();
+              void searchAddress(inputRef.current?.value ?? query);
             }
           }}
           onBlur={() => {
-            window.setTimeout(() => setSuggestionsOpen(false), 180);
+            window.setTimeout(() => {
+              setSuggestionsOpen(false);
+              const text = (inputRef.current?.value || "").trim();
+              if (text.length >= 5 && text !== emittedAddressRef.current) void searchAddress(text);
+            }, 180);
           }}
           placeholder="Улица и дом в Симферополе"
           required
@@ -420,10 +428,12 @@ export default function YandexMapPicker({
             aria-label="Очистить адрес"
             onMouseDown={(e) => e.preventDefault()}
             onClick={() => {
+              emittedAddressRef.current = "";
               setQuery("");
               setSuggestions([]);
               setSuggestionsOpen(false);
               setGeocodeError(false);
+              onClearRef.current?.();
               inputRef.current?.focus();
             }}
           >
@@ -467,7 +477,7 @@ export default function YandexMapPicker({
       {locationError ? (
         <p className="map-picker-status">Не удалось определить геоположение. Передвиньте карту — адрес подставится сам.</p>
       ) : geocodeError ? (
-        <p className="map-picker-status">
+        <p className="map-picker-status is-error">
           <AlertCircle size={13} />
           Не удалось определить адрес. Передвиньте карту или введите улицу и дом.
         </p>

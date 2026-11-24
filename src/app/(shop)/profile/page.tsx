@@ -490,8 +490,21 @@ function AddressesView() {
   useEffect(reload, []);
 
   async function remove(id: string) {
+    const target = addresses.find((item) => item.id === id);
     setAddresses((prev) => prev.filter((a) => a.id !== id));
     await fetch(`/api/me/addresses/${id}`, { method: "DELETE" });
+    if (!target) return;
+    try {
+      const list = JSON.parse(localStorage.getItem("starfood-saved-addresses") || "[]") as { id: string; address: string }[];
+      const next = list.filter((item) => item.id !== id && item.address !== target.address);
+      localStorage.setItem("starfood-saved-addresses", JSON.stringify(next));
+      if (localStorage.getItem("starfood-delivery-address") === target.address) {
+        localStorage.removeItem("starfood-delivery-address");
+        window.dispatchEvent(new CustomEvent("starfood:address-selected", { detail: { address: "" } }));
+      }
+    } catch {
+      localStorage.removeItem("starfood-saved-addresses");
+    }
   }
 
   async function makeDefault(id: string) {

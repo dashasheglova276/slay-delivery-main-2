@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { ArrowLeft, MapPin, X, Plus, Check } from "lucide-react";
+import { ArrowLeft, MapPin, X, Plus, Check, Trash2 } from "lucide-react";
 import Image from "next/image";
 import { usePathname } from "next/navigation";
 import YandexMapPicker from "@/components/yandex-map-picker";
@@ -20,6 +20,7 @@ export default function AddressOnboarding() {
   const [showLocations,setShowLocations]=useState(false);
   const [coords, setCoords] = useState<{lat:number;lng:number}|null>(null);
   const [manual, setManual] = useState("");
+  const [details, setDetails] = useState({ entrance: "", floor: "", apartment: "" });
   const [savedAddresses, setSavedAddresses] = useState<SavedAddress[]>([]);
   useEffect(() => {
     const saved = localStorage.getItem(KEY) || "";
@@ -45,10 +46,17 @@ export default function AddressOnboarding() {
     const show = () => { void openAddressPicker(); };
     const promptAddress = () => { if (!localStorage.getItem(KEY)) void openAddressPicker(); };
     const showPickup = () => { setPickup(true); setShowLocations(true); };
+    const onSelected = (event: Event) => {
+      const next = (event as CustomEvent<{ address?: string }>).detail?.address ?? "";
+      setAddress(next);
+      setManual(next);
+      if (!next) setCoords(null);
+    };
     window.addEventListener("starfood:open-address", show);
     window.addEventListener("starfood:address-needed", promptAddress);
     window.addEventListener("starfood:open-pickup",showPickup);
-    return () => {window.removeEventListener("starfood:open-address", show);window.removeEventListener("starfood:address-needed", promptAddress);window.removeEventListener("starfood:open-pickup",showPickup);};
+    window.addEventListener("starfood:address-selected", onSelected);
+    return () => {window.removeEventListener("starfood:open-address", show);window.removeEventListener("starfood:address-needed", promptAddress);window.removeEventListener("starfood:open-pickup",showPickup);window.removeEventListener("starfood:address-selected", onSelected);};
   }, []);
   async function openAddressPicker() {
     setOpen(true);
@@ -86,18 +94,38 @@ export default function AddressOnboarding() {
     setAddressBookOpen(false);
     window.dispatchEvent(new CustomEvent("starfood:address-selected", { detail: { address: item.address, lat: item.lat, lng: item.lng } }));
   }
+  async function removeSavedAddress(item: SavedAddress) {
+    const next = savedAddresses.filter((entry) => entry.address !== item.address);
+    setSavedAddresses(next);
+    localStorage.setItem(ADDRESS_LIST_KEY, JSON.stringify(next));
+    const serverIds = savedAddresses
+      .filter((entry) => entry.address === item.address && !entry.id.startsWith("local-"))
+      .map((entry) => entry.id);
+    await Promise.all(serverIds.map((id) => fetch(`/api/me/addresses/${id}`, { method: "DELETE" }).catch(() => undefined)));
+    if (address === item.address) {
+      localStorage.removeItem(KEY);
+      setAddress("");
+      setManual("");
+      setCoords(null);
+      window.dispatchEvent(new CustomEvent("starfood:address-selected", { detail: { address: "" } }));
+    }
+  }
+  function composedAddress(base: string) {
+    return [base.trim(), details.entrance.trim() && `подъезд ${details.entrance.trim()}`, details.floor.trim() && `этаж ${details.floor.trim()}`, details.apartment.trim() && `кв. ${details.apartment.trim()}`].filter(Boolean).join(", ");
+  }
   function choose(value = address) {
-    const next=value.trim(); if(!next)return;
+    const street = value.trim(); if(!street)return;
+    const next = composedAddress(street);
     if(pickup){if(!chosenLocation)return;localStorage.setItem("starfood-pickup-location",JSON.stringify(chosenLocation));}
     else {
       localStorage.setItem(KEY,next);
-      const existing = savedAddresses.find((item) => item.address === next);
+      const existing = savedAddresses.find((item) => item.address === next || item.address === street);
       const localItem = existing || { id: `local-${Date.now()}`, label: savedAddresses.length ? "Адрес" : "Дом", address: next, ...coords, isDefault: savedAddresses.length === 0 };
       const nextAddresses = existing ? savedAddresses : [...savedAddresses, localItem];
       setSavedAddresses(nextAddresses);
       localStorage.setItem(ADDRESS_LIST_KEY, JSON.stringify(nextAddresses));
       if (!existing) {
-        fetch("/api/me/addresses",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({label:localItem.label,address:next,isDefault:!savedAddresses.length,...(coords||{})})})
+        fetch("/api/me/addresses",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({label:localItem.label,address:street,entrance:details.entrance,floor:details.floor,apartment:details.apartment,isDefault:!savedAddresses.length,...(coords||{})})})
           .then(async (response) => { if (!response.ok) return; const data = await response.json(); if (data.address) { const merged = [...nextAddresses.filter((a) => !a.id.startsWith("local-") && a.address !== next), data.address]; setSavedAddresses(merged); localStorage.setItem(ADDRESS_LIST_KEY, JSON.stringify(merged)); } }).catch(()=>{});
       }
     }
@@ -106,15 +134,23 @@ export default function AddressOnboarding() {
   }
   return <>
     {pathname==="/"&&<div className="delivery-address-label"><button type="button" onClick={()=>{setPickup(false);try{localStorage.setItem("starfood-delivery-mode","delivery")}catch{};void openAddressBook()}}><MapPin size={18}/><span>{address||"Укажите адрес доставки"}</span><b>⌄</b></button></div>}
-    {addressBookOpen&&<div className="address-book-overlay" onMouseDown={e=>{if(e.target===e.currentTarget)setAddressBookOpen(false)}}><section className="address-book-sheet" role="dialog" aria-modal="true" aria-labelledby="address-book-title"><header><div><span>StarFood</span><h2 id="address-book-title">Адрес доставки</h2><p>Выберите сохранённый или добавьте новый</p></div><button type="button" aria-label="Закрыть" onClick={()=>setAddressBookOpen(false)}><X/></button></header><div className="address-book-list">{savedAddresses.length? savedAddresses.map(item=><button type="button" key={item.id} onClick={()=>selectSavedAddress(item)} className={address===item.address?"selected":""}><span className="address-book-icon"><MapPin size={20}/></span><span><b>{item.label}{item.isDefault?" · основной":""}</b><small>{item.address}</small></span>{address===item.address&&<Check size={20}/>}</button>):<p className="address-book-empty">Сохранённых адресов пока нет.</p>}</div><button type="button" className="address-book-add" onClick={()=>{setAddressBookOpen(false);setPickup(false);void openAddressPicker()}}><Plus size={20}/>Выбрать адрес на карте</button></section></div>}
+    {addressBookOpen&&<div className="address-book-overlay" onMouseDown={e=>{if(e.target===e.currentTarget)setAddressBookOpen(false)}}><section className="address-book-sheet" role="dialog" aria-modal="true" aria-labelledby="address-book-title"><header><div><span>StarFood</span><h2 id="address-book-title">Адрес доставки</h2><p>Выберите сохранённый или добавьте новый</p></div><button type="button" aria-label="Закрыть" onClick={()=>setAddressBookOpen(false)}><X/></button></header><div className="address-book-list">{savedAddresses.length? savedAddresses.map(item=><div key={item.id} className={`address-book-row${address===item.address?" selected":""}`}><button type="button" onClick={()=>selectSavedAddress(item)}><span className="address-book-icon"><MapPin size={20}/></span><span><b>{item.label}{item.isDefault?" · основной":""}</b><small>{item.address}</small></span>{address===item.address&&<Check size={20}/>}</button><button type="button" className="address-book-delete" aria-label={`Удалить адрес ${item.address}`} onClick={()=>void removeSavedAddress(item)}><Trash2 size={18}/></button></div>):<p className="address-book-empty">Сохранённых адресов пока нет.</p>}</div><button type="button" className="address-book-add" onClick={()=>{setAddressBookOpen(false);setPickup(false);void openAddressPicker()}}><Plus size={20}/>Выбрать адрес на карте</button></section></div>}
     {showLocations&&<div className="pickup-overlay" onMouseDown={e=>{if(e.target===e.currentTarget)setShowLocations(false)}}><section className="pickup-sheet"><header><div><h2>Выберите магазин</h2><p>Заберёте заказ в удобной точке</p></div><button onClick={()=>setShowLocations(false)}>Закрыть</button></header>{locations.length===0?<p className="pickup-empty">Пока нет доступных точек. Магазины появятся здесь после добавления в админ-панели.</p>:<div className="pickup-list">{locations.map(loc=><article key={loc.id} className="pickup-card"><div><h3>{loc.name}</h3><p>{loc.address}</p><small>{loc.hours}{loc.contact?` · ${loc.contact}`:""}</small>{loc.description&&<p>{loc.description}</p>}</div><button onClick={()=>{setChosenLocation(loc);localStorage.setItem("starfood-pickup-location",JSON.stringify(loc));window.dispatchEvent(new CustomEvent("starfood:pickup-selected",{detail:{location:loc}}));setShowLocations(false)}}>{chosenLocation?.id===loc.id?"Выбрано":"Выбрать"}</button></article>)}</div>}</section></div>}
     {open && <div className="map-fullscreen">
       <div className="map-topbar"><button onClick={()=>setOpen(false)} aria-label="Назад"><ArrowLeft/></button></div>
-      <div className="map-canvas"><YandexMapPicker value={address} className="map-picker-full" onSelect={({address:a,lat,lng})=>{setAddress(a);setManual(a);setCoords({lat,lng});}} />
+      <div className="map-canvas"><YandexMapPicker value={address} className="map-picker-full" onSelect={({address:a,lat,lng})=>{setAddress(a);setManual(a);setCoords({lat,lng});}} onClear={()=>{setAddress("");setManual("");setCoords(null);}} />
         <div className="map-center-pin"><Image src="/images/starfood-map-pin.png" alt="Метка StarFood" width={70} height={82} priority /></div>
       </div>
       <div className="map-bottom-sheet">
-        <div className="map-address-result"><MapPin size={20}/><div><small>{address ? "Адрес доставки" : "Куда привезти заказ"}</small><strong>{address||"Передвиньте карту или введите улицу и дом"}</strong></div></div>
+        <label className="map-address-edit">
+          <span>Улица и дом</span>
+          <input value={manual} onChange={(event) => setManual(event.target.value)} onBlur={() => { const next = manual.trim(); if (next && next !== address) setAddress(next); }} placeholder="Передвиньте карту или введите адрес" />
+        </label>
+        <div className="map-detail-grid">
+          <label>Подъезд<input value={details.entrance} inputMode="numeric" onChange={(event) => setDetails((current) => ({ ...current, entrance: event.target.value }))} /></label>
+          <label>Этаж<input value={details.floor} inputMode="numeric" onChange={(event) => setDetails((current) => ({ ...current, floor: event.target.value }))} /></label>
+          <label>Квартира<input value={details.apartment} inputMode="numeric" onChange={(event) => setDetails((current) => ({ ...current, apartment: event.target.value }))} /></label>
+        </div>
         <button type="button" className="map-locate-text" onClick={() => window.dispatchEvent(new Event("starfood:locate-me"))}>Определить моё местоположение</button>
         <button disabled={!address&&!manual.trim()} onClick={()=>choose(manual||address)}>Да, всё верно</button>
       </div>

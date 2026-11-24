@@ -50,7 +50,7 @@ export async function POST(request: NextRequest) {
     }
   }
   const images: string[] = Array.isArray(body.images) ? body.images : [body.image];
-  if (images.length < 3) {
+  if (images.length < 1) {
     return NextResponse.json({ error: "Загрузите минимум 3 фотографии товара" }, { status: 400 });
   }
   if (body.saleType === "weight") {

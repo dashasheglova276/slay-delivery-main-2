@@ -34,7 +34,7 @@ export interface ProductFormValues {
   active: boolean;
 }
 
-const MIN_IMAGES = 3;
+const MIN_IMAGES = 1;
 
 export default function ProductForm({
   initial,

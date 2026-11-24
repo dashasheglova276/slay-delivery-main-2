@@ -17,7 +17,7 @@ export async function PATCH(request: NextRequest, { params }: { params: { id: st
   }
 
   const body = await request.json();
-  if (body.images !== undefined && (!Array.isArray(body.images) || body.images.length < 3)) {
+  if (body.images !== undefined && (!Array.isArray(body.images) || body.images.length < 1)) {
     return NextResponse.json({ error: "У товара должно быть минимум 3 фотографии" }, { status: 400 });
   }
   if (body.saleType === "weight" && body.step !== undefined) {
